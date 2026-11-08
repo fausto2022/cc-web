@@ -1,0 +1,23 @@
+services:
+  cc-web:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      CC_WEB_LISTEN: 0.0.0.0:8080
+      CC_WEB_DB_PATH: /data/cc-web.db
+      CC_WEB_ALLOW_CONTAINER_BIND: "true"
+      CC_WEB_HOST_ROOT: /host
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - cc-web-data:/data
+      - /:/host:rw
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  cc-web-data:
