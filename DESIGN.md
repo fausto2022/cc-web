@@ -16,7 +16,7 @@
 
 ## 2. 桌面版现状与 Web 实现范围
 
-检查依据：`cc-haha` README 的桌面端亮点、`docs/desktop/index.md`、`docs/desktop/remote.md`、`docs/internals/desktop.md`、`docs/internals/server.md` 与 `desktop/src` 目录结构。当前产品不是单纯 Electron UI：React renderer 与 Server Sidecar、CLI 子进程、Electron Host 分进程协作；已有 H5 是受限远程客户端，不是完整桌面 Web 部署。H5 运行时会走浏览器 Host，但终端、Provider/MCP/技能管理、嵌入式浏览器和 Computer Use 等桌面 Host 能力明确不可用。Server 和 CLI 所在主机就是代码/命令执行位置，因此远程 Web 部署需要重新设计安全边界。
+检查依据：`cc-haha` README 的桌面端亮点、`docs/desktop/index.md`、`docs/desktop/remote.md`、`docs/internals/desktop.md`、`docs/internals/server.md` 与 `desktop/src` 目录结构。当前产品不是单纯 Electron UI：React renderer 与 Server Sidecar、CLI 子进程、Electron Host 分进程协作；已有 H5 是受限远程客户端，不是完整桌面 Web 部署。H5 运行时会走浏览器 Host，但终端、Provider/MCP/技能管理、嵌入式浏览器和 Computer Use 等桌面 Host 能力明确不可用。Server 和 CLI 所在主机就是代码/命令执行位置，因此远程 Web 部署需要重新设计安全边界。现有 REST 与浏览器 `/ws/:sessionId` 可作为产品/API 参考，但聊天通道最终落到 Claude 专用会话服务；内部 `/sdk/:sessionId` 是 Claude CLI 私有回连协议，不能作为 Codex 接口复用。新项目需在服务端抽出 runtime adapter，而不是只换 CLI executable。
 
 | 桌面版能力 | Web 版首期 | 实现策略/说明 |
 |---|---|---|
