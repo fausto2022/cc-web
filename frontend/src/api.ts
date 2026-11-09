@@ -4,17 +4,50 @@ export interface Project { id: string; name: string; path: string }
 export interface Session { id: string; projectId: string; title: string; provider: string; mode: string; status: string; createdAt: string }
 export interface Message { id: string; sessionId: string; role: string; content: string; createdAt: string }
 export interface ApiStatus { api: string; cliRuntime: string; teamRuntime: string; persistence: 'sqlite' | string }
-const API = import.meta.env.VITE_API_BASE ?? '';
+const API = (import.meta.env.VITE_API_BASE ?? import.meta.env.BASE_URL).replace(/\/+$/, '');
+export const AUTH_EXPIRED_EVENT = 'cc-web-auth-expired';
+let csrfToken = '';
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export interface AuthUser { username: string; mustChangePassword: boolean }
+interface AuthResponse { user: { username: string }; csrfToken: string; mustChangePassword: boolean }
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) { super(message); }
+}
+
+export function clearAuthState() { csrfToken = ''; }
+
+async function request<T>(path: string, init?: RequestInit, notifyUnauthorized = true): Promise<T> {
   let response: Response;
-  try { response = await fetch(`${API}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } }); }
-  catch { throw new Error('无法连接 cc-web 后端。请确认 backend 服务正在 127.0.0.1:8080 运行。'); }
+  const headers = new Headers(init?.headers);
+  if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  if (init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method.toUpperCase()) && csrfToken) headers.set('X-CSRF-Token', csrfToken);
+  try { response = await fetch(`${API}${path}`, { ...init, credentials: 'include', headers }); }
+  catch { throw new Error('无法连接 cc-web 后端。请确认 backend 服务正在运行。'); }
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401 && notifyUnauthorized) {
+      clearAuthState();
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
+    throw new ApiError(body?.error?.message ?? `HTTP ${response.status}`, response.status, body?.error?.code);
+  }
   return body as T;
 }
+function mapAuthResponse(response: AuthResponse): AuthUser {
+  csrfToken = response.csrfToken;
+  return { username: response.user.username, mustChangePassword: response.mustChangePassword };
+}
 export const api = {
+  authSession: async () => mapAuthResponse(await request<AuthResponse>('/api/auth/me', undefined, false)),
+  login: async (username: string, password: string) => mapAuthResponse(await request<AuthResponse>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }, false)),
+  changePassword: async (currentPassword: string, newPassword: string) => {
+    await request<void>('/api/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) }, false);
+    clearAuthState();
+  },
+  logout: async () => {
+    try { await request<void>('/api/auth/logout', { method: 'POST' }); }
+    finally { clearAuthState(); }
+  },
   status: () => request<{ status: ApiStatus }>('/api/status'),
   projects: () => request<{ projects: Project[] }>('/api/projects'),
   sessions: (projectId: string) => request<{ sessions: Session[] }>(`/api/sessions?projectId=${encodeURIComponent(projectId)}`),

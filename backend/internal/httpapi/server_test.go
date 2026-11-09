@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,14 +13,43 @@ import (
 	"strings"
 	"testing"
 
+	"cc-web/backend/internal/auth"
 	"cc-web/backend/internal/store"
 )
 
-func testServer() http.Handler {
-	return New(store.New(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+func testServer(t *testing.T) http.Handler {
+	t.Helper()
+	st := store.New()
+	svc := auth.New(st)
+	if err := svc.Bootstrap(context.Background(), "admin", "test-bootstrap-password-1"); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := svc.Login(context.Background(), "admin", "test-bootstrap-password-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ChangePassword(context.Background(), initial.UserID, "test-bootstrap-password-1", "test-current-password-2"); err != nil {
+		t.Fatal(err)
+	}
+	session, err := svc.Login(context.Background(), "admin", "test-current-password-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CC_WEB_ENV", "development")
+	t.Setenv("CC_WEB_COOKIE_SECURE", "false")
+	t.Setenv("CC_WEB_PUBLIC_ORIGIN", "")
+	base := New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.AddCookie(&http.Cookie{Name: "ccweb_session", Value: session.Token})
+		if isMutation(r.Method) {
+			r.Header.Set("Origin", "http://127.0.0.1:5177")
+			r.Header.Set("X-CSRF-Token", session.CSRFToken)
+		}
+		base.ServeHTTP(w, r)
+	})
 }
 func TestHealthAndRuntimeTruth(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	for _, tc := range []struct{ path, contains string }{{"/healthz", `"status":"ok"`}, {"/api/status", `"cliRuntime":"not_connected"`}, {"/api/status", `"persistence":"sqlite"`}} {
 		r := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		w := httptest.NewRecorder()
@@ -30,7 +60,7 @@ func TestHealthAndRuntimeTruth(t *testing.T) {
 	}
 }
 func TestCreateTeamPlanNeverClaimsDispatch(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions/session-login-refresh/team-runs", strings.NewReader(`{"taskPrompt":"Review refresh failure handling","members":[{"name":"auth-reviewer","role":"review","task":"Review refresh failure handling"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -52,7 +82,7 @@ func TestRegisterProjectConfinedToConfiguredWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("CC_WEB_HOST_ROOT", root)
-	h := testServer()
+	h := testServer(t)
 	allowedBody, _ := json.Marshal(map[string]string{"name": "repo", "path": inside})
 	allowed := httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewReader(allowedBody))
 	allowed.Header.Set("Content-Type", "application/json")
@@ -72,7 +102,7 @@ func TestRegisterProjectConfinedToConfiguredWorkspace(t *testing.T) {
 }
 
 func TestUnknownProjectRejected(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(`{"projectId":"outside","title":"x","provider":"Codex","mode":"single"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -82,7 +112,7 @@ func TestUnknownProjectRejected(t *testing.T) {
 	}
 }
 func TestApprovalCannotChangeTerminalDecision(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	create := httptest.NewRequest(http.MethodPost, "/api/sessions/session-login-refresh/approvals", strings.NewReader(`{"source":"Codex","command":"npm test","risk":"Runs project scripts"}`))
 	create.Header.Set("Content-Type", "application/json")
 	created := httptest.NewRecorder()
@@ -109,7 +139,7 @@ func TestApprovalCannotChangeTerminalDecision(t *testing.T) {
 	}
 }
 func TestTeamMessagesAreStoredSeparatelyFromConversation(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	create := httptest.NewRequest(http.MethodPost, "/api/sessions/session-login-refresh/team-runs", strings.NewReader(`{"taskPrompt":"Review refresh logic","members":[{"name":"review","role":"review","task":"Review refresh logic"}]}`))
 	create.Header.Set("Content-Type", "application/json")
 	created := httptest.NewRecorder()
@@ -146,7 +176,7 @@ func TestTeamMessagesAreStoredSeparatelyFromConversation(t *testing.T) {
 }
 
 func TestTeamModeCannotBeEnabledAfterConversationStarted(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	send := httptest.NewRequest(http.MethodPost, "/api/sessions/session-login-refresh/messages", strings.NewReader(`{"content":"first message"}`))
 	send.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -161,7 +191,7 @@ func TestTeamModeCannotBeEnabledAfterConversationStarted(t *testing.T) {
 }
 
 func TestCreateMessageRequiresExistingSession(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions/missing/messages", strings.NewReader(`{"content":"hello","teamMode":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -171,7 +201,7 @@ func TestCreateMessageRequiresExistingSession(t *testing.T) {
 	}
 }
 func TestLocalDevelopmentOriginAllowed(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	req.Header.Set("Origin", "http://127.0.0.1:5177")
 	w := httptest.NewRecorder()
@@ -182,7 +212,7 @@ func TestLocalDevelopmentOriginAllowed(t *testing.T) {
 }
 
 func TestUnknownOriginRejected(t *testing.T) {
-	h := testServer()
+	h := testServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	req.Header.Set("Origin", "https://evil.example")
 	w := httptest.NewRecorder()

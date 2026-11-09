@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,21 +11,43 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"cc-web/backend/internal/auth"
 	"cc-web/backend/internal/model"
 	"cc-web/backend/internal/store"
 )
 
 type Server struct {
-	store *store.Store
-	log   *slog.Logger
+	store        *store.Store
+	log          *slog.Logger
+	auth         *auth.Service
+	publicOrigin string
+	secureCookie bool
+	loginLimiter *loginLimiter
 }
 
+type contextKey string
+
+const sessionContextKey contextKey = "cc-web.auth-session"
+
 func New(st *store.Store, logger *slog.Logger) http.Handler {
-	s := &Server{store: st, log: logger}
+	return NewWithAuth(st, auth.New(st), logger)
+}
+
+func NewWithAuth(st *store.Store, authService *auth.Service, logger *slog.Logger) http.Handler {
+	publicOrigin := strings.TrimSpace(os.Getenv("CC_WEB_PUBLIC_ORIGIN"))
+	if publicOrigin == "" && os.Getenv("CC_WEB_ENV") != "development" {
+		logger.Warn("CC_WEB_PUBLIC_ORIGIN is unset; rejecting browser origins outside explicit development mode")
+	}
+	s := &Server{store: st, log: logger, auth: authService, publicOrigin: publicOrigin, secureCookie: !(os.Getenv("CC_WEB_ENV") == "development" && os.Getenv("CC_WEB_COOKIE_SECURE") == "false"), loginLimiter: newLoginLimiter()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/status", s.status)
+	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("GET /api/auth/me", s.me)
+	mux.HandleFunc("POST /api/auth/logout", s.logout)
+	mux.HandleFunc("POST /api/auth/password", s.changePassword)
 	mux.HandleFunc("GET /api/projects", s.projects)
 	mux.HandleFunc("POST /api/projects", s.registerProject)
 	mux.HandleFunc("GET /api/projects/{projectID}", s.project)
@@ -39,7 +63,190 @@ func New(st *store.Store, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/team-runs/{teamRunID}/messages", s.createTeamMessage)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/approvals", s.createApproval)
 	mux.HandleFunc("POST /api/approvals/{approvalID}/{decision}", s.resolveApproval)
-	return securityHeaders(cors(mux))
+	return securityHeaders(cors(s.authMiddleware(mux), s.publicOrigin))
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/api/status" {
+			if origin := r.Header.Get("Origin"); origin != "" && !s.validOrigin(r) {
+				writeError(w, http.StatusForbidden, "origin_denied", "request origin is not allowed")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/api/auth/login" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		cookie, err := r.Cookie(s.sessionCookieName())
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "login required")
+			return
+		}
+		session, err := s.auth.Authenticate(r.Context(), cookie.Value)
+		if errors.Is(err, auth.ErrSessionInvalid) {
+			s.clearSessionCookie(w)
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "login required")
+			return
+		}
+		if err != nil {
+			s.log.Error("session lookup failed", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "authentication temporarily unavailable")
+			return
+		}
+		if isMutation(r.Method) {
+			if !s.validOrigin(r) {
+				writeError(w, http.StatusForbidden, "origin_denied", "request origin is not allowed")
+				return
+			}
+			csrf := r.Header.Get("X-CSRF-Token")
+			if csrf == "" || subtle.ConstantTimeCompare([]byte(csrf), []byte(session.CSRFToken)) != 1 {
+				writeError(w, http.StatusForbidden, "csrf_invalid", "valid CSRF token required")
+				return
+			}
+		}
+		if session.MustChangePassword && r.URL.Path != "/api/auth/me" && r.URL.Path != "/api/auth/password" && r.URL.Path != "/api/auth/logout" {
+			writeError(w, http.StatusForbidden, "password_change_required", "change the initial password before continuing")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), sessionContextKey, session))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) sessionCookieName() string {
+	if s.secureCookie {
+		return "__Host-ccweb_session"
+	}
+	return "ccweb_session"
+}
+
+func isMutation(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete
+}
+
+func (s *Server) validOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	if s.publicOrigin != "" {
+		return origin == s.publicOrigin
+	}
+	return s.publicOrigin == "" && os.Getenv("CC_WEB_ENV") == "development" && isAllowedDevelopmentOrigin(origin)
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: token, Path: "/", Expires: expires, MaxAge: int(time.Until(expires).Seconds()), HttpOnly: true, Secure: s.secureCookie, SameSite: http.SameSiteStrictMode})
+}
+
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), HttpOnly: true, Secure: s.secureCookie, SameSite: http.SameSiteStrictMode})
+}
+
+func isJSONContentType(value string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(value, ";", 2)[0]))
+	return mediaType == "application/json"
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if !s.validOrigin(r) {
+		writeError(w, http.StatusForbidden, "origin_denied", "request origin is not allowed")
+		return
+	}
+	if !s.loginLimiter.allow(clientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many login attempts")
+		return
+	}
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeError(w, http.StatusUnsupportedMediaType, "content_type_required", "application/json required")
+		return
+	}
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON request")
+		return
+	}
+	session, err := s.auth.Login(r.Context(), in.Username, in.Password)
+	if errors.Is(err, auth.ErrInvalidCredentials) {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "username or password is incorrect")
+		return
+	}
+	if errors.Is(err, auth.ErrLoginInput) {
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "username or password is invalid")
+		return
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "constraint failed") || strings.Contains(err.Error(), "unique constraint") {
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "username or password is incorrect")
+			return
+		}
+		s.log.Error("login failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "login_failed", "login unavailable")
+		return
+	}
+	s.setSessionCookie(w, session.Token, session.ExpiresAt)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"user": map[string]string{"username": session.Username}, "csrfToken": session.CSRFToken, "mustChangePassword": session.MustChangePassword})
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	session, _ := r.Context().Value(sessionContextKey).(store.AuthSession)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"user": map[string]string{"username": session.Username}, "csrfToken": session.CSRFToken, "mustChangePassword": session.MustChangePassword})
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	cookie, _ := r.Cookie(s.sessionCookieName())
+	if cookie != nil {
+		if err := s.auth.Logout(r.Context(), cookie.Value); err != nil {
+			writeError(w, http.StatusInternalServerError, "logout_failed", "could not end session")
+			return
+		}
+	}
+	s.clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON request")
+		return
+	}
+	session, _ := r.Context().Value(sessionContextKey).(store.AuthSession)
+	err := s.auth.ChangePassword(r.Context(), session.UserID, in.CurrentPassword, in.NewPassword)
+	switch {
+	case errors.Is(err, auth.ErrPasswordPolicy):
+		writeError(w, http.StatusBadRequest, "password_policy", "password must contain 12 to 128 bytes")
+		return
+	case errors.Is(err, auth.ErrCurrentPassword):
+		writeError(w, http.StatusUnauthorized, "current_password_invalid", "current password is incorrect")
+		return
+	case err != nil:
+		s.log.Error("password change failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "password_change_failed", "could not change password")
+		return
+	}
+	s.clearSessionCookie(w)
+	if passwordFile := strings.TrimSpace(os.Getenv("CC_WEB_ADMIN_PASSWORD_FILE")); passwordFile != "" {
+		_ = os.Remove(passwordFile)
+	} else if dbPath := strings.TrimSpace(os.Getenv("CC_WEB_DB_PATH")); dbPath != "" {
+		_ = os.Remove(dbPath + ".bootstrap-password")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -345,6 +552,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
@@ -357,6 +565,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Frame-Options", "DENY")
+		if strings.HasPrefix(r.URL.Path, "/api/auth/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -364,18 +575,22 @@ func isAllowedDevelopmentOrigin(origin string) bool {
 	return origin == "http://localhost:5173" || origin == "http://127.0.0.1:5173" || origin == "http://localhost:5176" || origin == "http://127.0.0.1:5176" || origin == "http://localhost:5177" || origin == "http://127.0.0.1:5177"
 }
 
-func cors(next http.Handler) http.Handler {
+func cors(next http.Handler, publicOrigin string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if !isAllowedDevelopmentOrigin(origin) {
+			developmentOrigin := publicOrigin == "" && os.Getenv("CC_WEB_ENV") == "development" && isAllowedDevelopmentOrigin(origin)
+			if !developmentOrigin && origin != publicOrigin {
 				writeError(w, http.StatusForbidden, "origin_denied", "origin is not allowed")
 				return
 			}
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if developmentOrigin {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token")
+			}
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

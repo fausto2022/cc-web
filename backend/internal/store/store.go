@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -83,6 +85,29 @@ CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applie
 	if err != nil {
 		return fmt.Errorf("record migration: %w", err)
 	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&version); err != nil {
+		return fmt.Errorf("read migration version: %w", err)
+	}
+	if version < 2 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin auth migration: %w", err)
+		}
+		defer tx.Rollback()
+		const authSchema = `CREATE TABLE users(id TEXT PRIMARY KEY,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,must_change_password INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,password_changed_at TEXT NOT NULL);
+CREATE TABLE auth_sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,csrf_token TEXT NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE INDEX auth_sessions_user_expiry ON auth_sessions(user_id,expires_at);`
+		if _, err := tx.ExecContext(ctx, authSchema); err != nil {
+			return fmt.Errorf("apply auth migration: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)", stamp(time.Now())); err != nil {
+			return fmt.Errorf("record auth migration: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit auth migration: %w", err)
+		}
+	}
 	return nil
 }
 func (s *Store) seed(ctx context.Context) error {
@@ -114,7 +139,11 @@ func (s *Store) seed(ctx context.Context) error {
 }
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 func newID(prefix string) string {
-	return prefix + "-" + time.Now().UTC().Format("20060102150405.000000000")
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		panic(fmt.Errorf("generate %s id: %w", prefix, err))
+	}
+	return prefix + "-" + time.Now().UTC().Format("20060102150405.000000000") + "-" + hex.EncodeToString(random[:])
 }
 func insertSession(ctx context.Context, tx *sql.Tx, v model.Session) error {
 	_, err := tx.ExecContext(ctx, "INSERT INTO sessions(id,project_id,title,provider,mode,status,created_at) VALUES(?,?,?,?,?,?,?)", v.ID, v.ProjectID, v.Title, v.Provider, v.Mode, v.Status, stamp(v.CreatedAt))

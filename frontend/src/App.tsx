@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { agentTeamsAdapter, api, type ApiStatus, type Project, type Session } from './api';
+import AuthScreen from './AuthScreen';
+import { agentTeamsAdapter, api, AUTH_EXPIRED_EVENT, ApiError, clearAuthState, type ApiStatus, type AuthUser, type Project, type Session } from './api';
 import type { AgentMember, AgentTeamSnapshot } from './types';
 
 type IconName = 'panel' | 'search' | 'plus' | 'chevron' | 'terminal' | 'files' | 'send' | 'spark' | 'clock' | 'dots' | 'close' | 'back' | 'warning' | 'check' | 'moon';
@@ -31,6 +32,10 @@ const seedMessages = [
 ];
 
 export default function App() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authError, setAuthError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
   const [snapshot, setSnapshot] = useState<AgentTeamSnapshot | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -48,6 +53,25 @@ export default function App() {
   const [messages, setMessages] = useState(seedMessages);
   const [toast, setToast] = useState('');
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
+
+  useEffect(() => {
+    let mounted = true;
+    api.authSession().then((user) => { if (mounted) setAuthUser(user); }).catch((error) => {
+      if (mounted && !(error instanceof ApiError && error.status === 401)) setAuthError(error instanceof Error ? error.message : '无法验证登录状态。');
+    }).finally(() => { if (mounted) setAuthLoading(false); });
+    const onUnauthorized = () => {
+      setAuthUser(null);
+      setProjects([]);
+      setSessions([]);
+      setMessages([]);
+      setActiveSessionId('');
+      setSnapshot(null);
+      setAuthError('登录状态已失效，请重新登录。');
+      setAuthNotice('');
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onUnauthorized);
+    return () => { mounted = false; window.removeEventListener(AUTH_EXPIRED_EVENT, onUnauthorized); };
+  }, []);
 
   async function refreshWorkspace() {
     try {
@@ -69,9 +93,9 @@ export default function App() {
       setLoadError('');
     } catch (error) { setLoadError(error instanceof Error ? error.message : '无法连接 API。'); }
   }
-  useEffect(() => { void refreshWorkspace(); }, []);
-  useEffect(() => { void agentTeamsAdapter.getSnapshot(activeSessionId || null).then(setSnapshot); }, [activeSessionId]);
-  useEffect(() => { if (activeSessionId) void agentTeamsAdapter.refreshTeamPlan(activeSessionId).then((value) => { if (value.teamId) setSnapshot(value); }); }, [activeSessionId]);
+  useEffect(() => { if (authUser && !authUser.mustChangePassword) void refreshWorkspace(); }, [authUser]);
+  useEffect(() => { if (authUser && !authUser.mustChangePassword) void agentTeamsAdapter.getSnapshot(activeSessionId || null).then(setSnapshot); }, [activeSessionId, authUser]);
+  useEffect(() => { if (authUser && !authUser.mustChangePassword && activeSessionId) void agentTeamsAdapter.refreshTeamPlan(activeSessionId).then((value) => { if (value.teamId) setSnapshot(value); }); }, [activeSessionId, authUser]);
   useEffect(() => {
     if (!toast) return;
     const timeout = window.setTimeout(() => setToast(''), 2800);
@@ -112,6 +136,34 @@ export default function App() {
     } catch (error) { setToast(error instanceof Error ? error.message : '发送失败。'); }
   }
 
+  async function login(username: string, password: string) {
+    const user = await api.login(username, password);
+    setAuthError('');
+    setAuthNotice('');
+    setAuthUser(user);
+  }
+
+  async function changePassword(currentPassword: string, newPassword: string) {
+    await api.changePassword(currentPassword, newPassword);
+    setAuthUser(null);
+    setAuthError('');
+    setAuthNotice('密码已更新，请使用新密码重新登录。');
+  }
+
+  async function logout() {
+    try { await api.logout(); } catch { /* Unauthorized responses already clear local state. */ }
+    clearAuthState();
+    setAuthUser(null);
+    setProjects([]);
+    setSessions([]);
+    setMessages([]);
+    setActiveSessionId('');
+    setSnapshot(null);
+  }
+
+  if (authLoading) return <main className="auth-loading" aria-live="polite">正在验证登录状态…</main>;
+  if (!authUser || authUser.mustChangePassword) return <AuthScreen key={authUser?.mustChangePassword ? 'change-password' : 'login'} username={authUser?.username} mustChangePassword={Boolean(authUser?.mustChangePassword)} initialError={authError} notice={authNotice} onLogin={login} onChangePassword={changePassword} />;
+
   return (
     <div className={`app-shell ${theme}`}>
       <header className="topbar">
@@ -124,7 +176,7 @@ export default function App() {
         <div className="topbar-right">
           <span className="connection-pill"><i className="connection-dot" />{apiStatus ? `API ${apiStatus.api} · 数据库 ${apiStatus.persistence} · CLI ${apiStatus.cliRuntime}` : `API 未连接${loadError ? ` · ${loadError}` : ''}`}</span>
           <button className="icon-button theme-button" aria-label="切换主题" title="切换主题" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}><Icon name="moon" /></button>
-          <button className="user-menu" aria-label="本地预览用户">A</button>
+          <button className="user-menu" aria-label={`退出登录 ${authUser.username}`} title={`退出登录 ${authUser.username}`} onClick={() => void logout()}>{authUser.username.slice(0, 1).toUpperCase()}</button>
         </div>
       </header>
 

@@ -1,4 +1,14 @@
 services:
+  cc-web-frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_BASE_PATH: /cc-web/
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18090:80"
+    depends_on:
+      - cc-web
   cc-web:
     build:
       context: ./backend
@@ -9,6 +19,7 @@ services:
       CC_WEB_DB_PATH: /data/cc-web.db
       CC_WEB_ALLOW_CONTAINER_BIND: "true"
       CC_WEB_HOST_ROOT: /host
+      CC_WEB_PUBLIC_ORIGIN: https://103.11.77.113
     ports:
       - "127.0.0.1:18089:8080"
     volumes:
