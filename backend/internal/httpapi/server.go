@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,12 +20,13 @@ import (
 )
 
 type Server struct {
-	store        *store.Store
-	log          *slog.Logger
-	auth         *auth.Service
-	publicOrigin string
-	secureCookie bool
-	loginLimiter *loginLimiter
+	store          *store.Store
+	log            *slog.Logger
+	auth           *auth.Service
+	publicOrigin   string
+	secureCookie   bool
+	loginLimiter   *loginLimiter
+	trustedProxies []netip.Prefix
 }
 
 type contextKey string
@@ -40,7 +42,7 @@ func NewWithAuth(st *store.Store, authService *auth.Service, logger *slog.Logger
 	if publicOrigin == "" && os.Getenv("CC_WEB_ENV") != "development" {
 		logger.Warn("CC_WEB_PUBLIC_ORIGIN is unset; rejecting browser origins outside explicit development mode")
 	}
-	s := &Server{store: st, log: logger, auth: authService, publicOrigin: publicOrigin, secureCookie: !(os.Getenv("CC_WEB_ENV") == "development" && os.Getenv("CC_WEB_COOKIE_SECURE") == "false"), loginLimiter: newLoginLimiter()}
+	s := &Server{store: st, log: logger, auth: authService, publicOrigin: publicOrigin, secureCookie: !(os.Getenv("CC_WEB_ENV") == "development" && os.Getenv("CC_WEB_COOKIE_SECURE") == "false"), loginLimiter: newLoginLimiter(), trustedProxies: parseTrustedProxies(os.Getenv("CC_WEB_TRUSTED_PROXIES"))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/status", s.status)
@@ -160,7 +162,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "origin_denied", "request origin is not allowed")
 		return
 	}
-	if !s.loginLimiter.allow(clientIP(r)) {
+	client, ok := clientIP(r, s.trustedProxies)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "client_ip_invalid", "trusted proxy must provide one valid X-Real-IP address")
+		return
+	}
+	if !s.loginLimiter.allow(client) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many login attempts")
 		return
 	}

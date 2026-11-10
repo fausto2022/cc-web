@@ -31,6 +31,7 @@ func authTestHandler(t *testing.T) (http.Handler, *store.Store) {
 	t.Setenv("CC_WEB_ENV", "development")
 	t.Setenv("CC_WEB_COOKIE_SECURE", "false")
 	t.Setenv("CC_WEB_PUBLIC_ORIGIN", "")
+	t.Setenv("CC_WEB_TRUSTED_PROXIES", "")
 	return New(st, slog.New(slog.NewTextHandler(io.Discard, nil))), st
 }
 
@@ -216,6 +217,83 @@ func TestLoginRateLimitPerClientIP(t *testing.T) {
 	}
 	if got := serveLogin("192.0.2.2:1234"); got.Code != http.StatusBadRequest {
 		t.Fatalf("first attempt from second IP: got %d, want %d (%s)", got.Code, http.StatusBadRequest, got.Body.String())
+	}
+}
+
+func loginAttempt(h http.Handler, remoteAddr string, realIPs ...string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString("{"))
+	request.RemoteAddr = remoteAddr
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://127.0.0.1:5177")
+	request.Header.Set("X-Forwarded-For", "198.51.100.250, 203.0.113.250")
+	request.Header.Set("Forwarded", "for=198.51.100.250")
+	for _, ip := range realIPs {
+		request.Header.Add("X-Real-IP", ip)
+	}
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	return response
+}
+
+func TestLoginRateLimitTrustedProxyUsesXRealIP(t *testing.T) {
+	h, st := authTestHandler(t)
+	defer st.Close()
+	t.Setenv("CC_WEB_TRUSTED_PROXIES", "172.26.0.1/32")
+	h = New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		if got := loginAttempt(h, "172.26.0.1:1234", "198.51.100.10"); got.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d from first client: got %d, want %d (%s)", attempt, got.Code, http.StatusBadRequest, got.Body.String())
+		}
+	}
+	if got := loginAttempt(h, "172.26.0.1:1234", "198.51.100.10"); got.Code != http.StatusTooManyRequests {
+		t.Fatalf("sixth attempt from first client: got %d, want %d (%s)", got.Code, http.StatusTooManyRequests, got.Body.String())
+	}
+	if got := loginAttempt(h, "172.26.0.1:1234", "198.51.100.11"); got.Code != http.StatusBadRequest {
+		t.Fatalf("first attempt from second client: got %d, want %d (%s)", got.Code, http.StatusBadRequest, got.Body.String())
+	}
+}
+
+func TestLoginRateLimitIgnoresForwardedHeadersFromUntrustedPeer(t *testing.T) {
+	h, st := authTestHandler(t)
+	defer st.Close()
+	t.Setenv("CC_WEB_TRUSTED_PROXIES", "172.26.0.1/32")
+	h = New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		if got := loginAttempt(h, "192.0.2.10:1234", "198.51.100.10"); got.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d from first peer: got %d, want %d (%s)", attempt, got.Code, http.StatusBadRequest, got.Body.String())
+		}
+	}
+	if got := loginAttempt(h, "192.0.2.10:1234", "198.51.100.10"); got.Code != http.StatusTooManyRequests {
+		t.Fatalf("sixth attempt from first peer: got %d, want %d (%s)", got.Code, http.StatusTooManyRequests, got.Body.String())
+	}
+	if got := loginAttempt(h, "192.0.2.11:1234", "198.51.100.10"); got.Code != http.StatusBadRequest {
+		t.Fatalf("spoofed forwarding headers shared another peer bucket: got %d, want %d (%s)", got.Code, http.StatusBadRequest, got.Body.String())
+	}
+}
+
+func TestTrustedProxyRejectsMissingOrInvalidXRealIP(t *testing.T) {
+	tests := []struct {
+		name    string
+		realIPs []string
+	}{
+		{name: "missing"},
+		{name: "duplicate", realIPs: []string{"198.51.100.10", "198.51.100.11"}},
+		{name: "chain", realIPs: []string{"198.51.100.10, 198.51.100.11"}},
+		{name: "malformed", realIPs: []string{"not-an-ip"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, st := authTestHandler(t)
+			defer st.Close()
+			t.Setenv("CC_WEB_TRUSTED_PROXIES", "172.26.0.1/32")
+			h = New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			got := loginAttempt(h, "172.26.0.1:1234", tt.realIPs...)
+			if got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), "client_ip_invalid") {
+				t.Fatalf("invalid X-Real-IP accepted: got %d (%s)", got.Code, got.Body.String())
+			}
+		})
 	}
 }
 
