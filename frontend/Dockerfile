@@ -5,7 +5,9 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY . .
-RUN npm exec vite -- build --base=/cc-web/
+ARG VITE_BASE_PATH=/cc-web/
+ENV VITE_BASE_PATH=${VITE_BASE_PATH}
+RUN npm exec tsc -- -b && npm exec vite -- build --base="${VITE_BASE_PATH}"
 
 FROM nginx:alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf

@@ -20,6 +20,7 @@ services:
       CC_WEB_ALLOW_CONTAINER_BIND: "true"
       CC_WEB_HOST_ROOT: /host
       CC_WEB_PUBLIC_ORIGIN: https://103.11.77.113
+      CC_WEB_TRUSTED_PROXIES: 172.26.0.1/32
     ports:
       - "127.0.0.1:18089:8080"
     volumes:
