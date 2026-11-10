@@ -14,13 +14,16 @@ The service binds to `127.0.0.1:8080` by default. Set `CC_WEB_LISTEN` only to a 
 
 ## Docker
 
-From the repository root:
+From the repository root, build the images, initialize the single administrator once from an interactive SSH terminal, then start the services:
 
 ```sh
-docker compose up -d --build
-docker compose logs -f cc-web
-docker compose down
+docker compose build
+docker compose run --rm --no-deps cc-web admin init --username admin
+docker compose up -d
+docker compose ps
 ```
+
+The init command requires a TTY, reads the password and confirmation without echo, stores only an Argon2id hash in SQLite, and does not print the password. Ordinary service startup fails closed until the administrator is initialized. Never pass the password in command-line arguments, shell history, environment variables, or logs.
 
 Compose mounts the named volume `cc-web-data` at `/data`, which persists the SQLite database across container recreation. At the user's explicit request, it runs as UID/GID 0 and bind-mounts the entire host root (`/`) read-write at `/host`; `CC_WEB_HOST_ROOT=/host` identifies this path inside the container. This allows modifying or deleting host files wherever the Docker daemon permits and exposes secrets/system files. It is not privileged mode, but is still effectively a host-administration capability: application compromise can become server compromise even when login is enabled. No untrusted users or agent/tool execution should be allowed on this instance. The current API can register existing directories under `/host`; complete file browsing/editing APIs are not implemented. The API port remains loopback-only at `127.0.0.1:18089`; Nginx terminates HTTPS at `/cc-web/`.
 
@@ -30,7 +33,7 @@ Back up the named volume before upgrades. One portable approach is to stop the s
 
 ## Initial administrator
 
-On first start, if the SQLite database has no administrator, the service creates `admin` with a cryptographically random one-time password and writes it to `/data/cc-web.db.bootstrap-password` with mode `0600`. The plaintext is never written to application logs or returned by an API. Read it only through an authenticated SSH session using `docker compose exec -T cc-web cat /data/cc-web.db.bootstrap-password`; do not paste it into chat, shell history, tickets, or logs. Sign in at the HTTPS address, immediately set a new password of 12-128 bytes, then remove the bootstrap file with `docker compose exec -T cc-web rm -f /data/cc-web.db.bootstrap-password`. The application forces password change before allowing access to projects or sessions. If the bootstrap file is lost before initialization completes, stop and follow the recovery procedure rather than exposing a public setup endpoint.
+The database is not initialized automatically. With the backend image built and the services stopped or the backend not yet started, connect to the server through an interactive SSH terminal and run `docker compose run --rm --no-deps cc-web admin init --username admin`. Do not add `-T`: the command needs a TTY for two hidden password entries. It creates exactly one administrator, stores an Argon2id password hash, and marks the account as requiring a password change. Re-running initialization is rejected. Ordinary service startup refuses to listen while no administrator exists. After starting the services, sign in through HTTPS and change the initial password before using projects or sessions.
 
 ## API
 
